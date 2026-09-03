@@ -670,7 +670,9 @@ def _stream_discrete_metrics(
             category_output['spearman'] = Spearman()._calc(scores, ground_truth)
         output[category] = category_output
 
-    return output
+    if mask_filename:
+        return output
+    return output['total']
 
 
 def main():
@@ -702,10 +704,9 @@ def main():
         raise ValueError('--chunk-size must be positive')
     if (
         streaming_enabled
-        and args.mask
         and _is_text_profile(args.ground_truth)
         and _is_text_profile(args.predictions)
-        and _is_text_profile(args.mask)
+        and (not args.mask or _is_text_profile(args.mask))
         and args.plots_dir is None
     ):
         output = _stream_discrete_metrics(
