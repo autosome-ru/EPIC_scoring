@@ -11,6 +11,7 @@ import struct
 import gzip
 import contextlib
 import argparse
+from itertools import islice
 from functools import cached_property
 from pathlib import Path
 from uuid import uuid4
@@ -359,6 +360,12 @@ def get_argparser():
                            "Must have the same length as input profiles.")
     argparser.add_argument('--mask-mode', choices=['mask', 'inverse', 'both', 'all'], default='mask', metavar='MODE',
                            help="How to apply mask: 'mask' (use mask=1), 'inverse' (use mask=0), 'both' (compute both separately), all (both + without masking)")
+    argparser.add_argument('--streaming', action='store_true',
+                           help="Use the histogram/streaming scorer for quantized text predictions")
+    argparser.add_argument('--score-scale', type=int, default=100_000, metavar='N',
+                           help="Scale for quantized streaming predictions (default: %(default)s; 5 decimal places)")
+    argparser.add_argument('--chunk-size', type=int, default=1_000_000, metavar='N',
+                           help="Number of text positions processed per streaming chunk (default: %(default)s)")
     argparser.add_argument('--plots-dir', metavar='DIR',
                            help="Directory for metric plots")
 
@@ -436,6 +443,236 @@ def compute_all_metrics(scoring_data, scorers, plots_dir=None):
     return all_scores
 
 
+def _is_text_profile(filename):
+    return filename and (
+        filename in {'-', 'stdin'}
+        or filename.endswith('.txt')
+        or filename.endswith('.txt.gz')
+    )
+
+
+def _histogram_classification_metrics(positive_counts, negative_counts):
+    """Calculate tie-aware ROC-AUC and average precision from score bins."""
+    total_positive = int(positive_counts.sum())
+    total_negative = int(negative_counts.sum())
+    if total_positive == 0 or total_negative == 0:
+        return {'rocauc': 0.0, 'prauc': 0.0}
+
+    # ROC-AUC: process scores from low to high and assign half credit to ties.
+    negative_below = 0
+    auc_numerator = 0.0
+    for positive_at_score, negative_at_score in zip(
+        positive_counts, negative_counts
+    ):
+        positive_at_score = int(positive_at_score)
+        negative_at_score = int(negative_at_score)
+        auc_numerator += positive_at_score * (
+            negative_below + negative_at_score / 2.0
+        )
+        negative_below += negative_at_score
+
+    # Average precision: process distinct scores from high to low.
+    true_positive = 0
+    seen = 0
+    prauc = 0.0
+    for positive_at_score, negative_at_score in zip(
+        positive_counts[::-1], negative_counts[::-1]
+    ):
+        positive_at_score = int(positive_at_score)
+        negative_at_score = int(negative_at_score)
+        if positive_at_score:
+            true_positive += positive_at_score
+            seen += positive_at_score + negative_at_score
+            prauc += (
+                (true_positive / seen)
+                * (positive_at_score / total_positive)
+            )
+        else:
+            seen += negative_at_score
+
+    return {
+        'rocauc': auc_numerator / (total_positive * total_negative),
+        'prauc': prauc,
+    }
+
+
+def _stream_discrete_metrics(
+    ground_truth_filename,
+    predictions_filename,
+    mask_filename,
+    mask_mode,
+    mode,
+    noise_threshold,
+    score_scale,
+    chunk_size,
+):
+    """Score decimal predictions without materializing all positions.
+
+    This path is intended for predictions in [0, 1] quantized to
+    ``score_scale`` steps.  Such predictions have only ``score_scale + 1``
+    possible ranks, so classification metrics can be accumulated in
+    fixed-size histograms. Regression pairs are retained only where ground
+    truth is non-zero.
+    """
+    need_classification = mode in {'classification', 'all'}
+    need_regression = mode in {'regression', 'all'}
+
+    score_bins = score_scale + 1
+    positive_counts = {}
+    negative_counts = {}
+    regression_predictions = {}
+    regression_ground_truth = {}
+
+    category_names = []
+    if mask_filename:
+        if mask_mode in {'mask', 'both', 'all'}:
+            category_names.append('mask')
+        if mask_mode in {'inverse', 'both', 'all'}:
+            category_names.append('inverted_mask')
+        if mask_mode == 'all':
+            category_names.append('total')
+    else:
+        category_names.append('total')
+
+    for category in category_names:
+        if need_classification:
+            positive_counts[category] = np.zeros(
+                score_bins, dtype=np.int64
+            )
+            negative_counts[category] = np.zeros(
+                score_bins, dtype=np.int64
+            )
+        if need_regression:
+            regression_predictions[category] = []
+            regression_ground_truth[category] = []
+
+    with contextlib.ExitStack() as stack:
+        ground_truth_fp = stack.enter_context(
+            open_for_read(ground_truth_filename, mode='rt')
+        )
+        predictions_fp = stack.enter_context(
+            open_for_read(predictions_filename, mode='rt')
+        )
+        mask_fp = None
+        if mask_filename:
+            mask_fp = stack.enter_context(open_for_read(mask_filename, mode='rt'))
+
+        while True:
+            ground_truth_chunk = np.fromiter(
+                islice(ground_truth_fp, chunk_size),
+                dtype=np.float64,
+                count=-1,
+            )
+            prediction_chunk = np.fromiter(
+                islice(predictions_fp, chunk_size),
+                dtype=np.float64,
+                count=-1,
+            )
+            if mask_fp is not None:
+                mask_chunk = np.fromiter(
+                    (line[0] == '1' for line in islice(mask_fp, chunk_size)),
+                    dtype=np.bool_,
+                    count=-1,
+                )
+            else:
+                mask_chunk = None
+
+            lengths = [len(ground_truth_chunk), len(prediction_chunk)]
+            if mask_chunk is not None:
+                lengths.append(len(mask_chunk))
+            if len(set(lengths)) != 1:
+                raise ValueError(
+                    f'Input files have different lengths near position '
+                    f'{sum(lengths) - min(lengths) + 1}'
+                )
+            if not ground_truth_chunk.size:
+                break
+
+            valid = (
+                (ground_truth_chunk == 0)
+                | (ground_truth_chunk > noise_threshold)
+            )
+            signal = valid & (ground_truth_chunk > 0)
+            prediction_bins = np.rint(
+                prediction_chunk * score_scale
+            ).astype(np.int64)
+            if np.any(
+                valid
+                & (
+                    (prediction_bins < 0)
+                    | (prediction_bins >= score_bins)
+                )
+            ):
+                raise ValueError(
+                    f'Prediction outside [0, 1] near position '
+                    f'{sum(lengths) - len(ground_truth_chunk) + 1}'
+                )
+
+            if mask_chunk is None:
+                category_masks = {'total': np.ones(len(valid), dtype=bool)}
+            elif mask_mode == 'mask':
+                category_masks = {'mask': mask_chunk}
+            elif mask_mode == 'inverse':
+                category_masks = {'inverted_mask': ~mask_chunk}
+            elif mask_mode == 'both':
+                category_masks = {
+                    'mask': mask_chunk,
+                    'inverted_mask': ~mask_chunk,
+                }
+            elif mask_mode == 'all':
+                category_masks = {
+                    'mask': mask_chunk,
+                    'inverted_mask': ~mask_chunk,
+                    'total': np.ones(len(valid), dtype=bool),
+                }
+            else:
+                raise ValueError(f'Unknown mask mode: {mask_mode}')
+
+            for category, category_mask in category_masks.items():
+                selected = valid & category_mask
+                if need_classification:
+                    positive_counts[category] += np.bincount(
+                        prediction_bins[selected & signal],
+                        minlength=score_bins,
+                    )
+                    negative_counts[category] += np.bincount(
+                        prediction_bins[selected & ~signal],
+                        minlength=score_bins,
+                    )
+                if need_regression:
+                    selected_signal = selected & signal
+                    regression_predictions[category].append(
+                        prediction_bins[selected_signal]
+                    )
+                    regression_ground_truth[category].append(
+                        ground_truth_chunk[selected_signal]
+                    )
+
+    output = {}
+    for category in category_names:
+        category_output = {}
+        if need_classification:
+            category_output.update(_histogram_classification_metrics(
+                positive_counts[category], negative_counts[category]
+            ))
+        if need_regression:
+            if regression_predictions[category]:
+                scores = np.concatenate(
+                    regression_predictions[category]
+                ).astype(np.float32, copy=False) / np.float32(score_scale)
+                ground_truth = np.concatenate(
+                    regression_ground_truth[category]
+                ).astype(np.float32, copy=False)
+            else:
+                scores = np.empty(0, dtype=np.float32)
+                ground_truth = np.empty(0, dtype=np.float32)
+            category_output['pearson'] = Pearson()._calc(scores, ground_truth)
+            category_output['spearman'] = Spearman()._calc(scores, ground_truth)
+        output[category] = category_output
+
+    return output
+
+
 def main():
     argparser = get_argparser()
 
@@ -454,6 +691,43 @@ def main():
         dtype = '<f8'
     elif args.dtype == 'float32':
         dtype = '<f4'
+
+    # Quantized decimal predictions can be scored from fixed-size histograms
+    # and only signal positions need to be retained for regression.  The
+    # The backend is explicitly selected by --streaming.
+    streaming_enabled = args.streaming
+    if args.score_scale <= 0:
+        raise ValueError('--score-scale must be positive')
+    if args.chunk_size <= 0:
+        raise ValueError('--chunk-size must be positive')
+    if (
+        streaming_enabled
+        and args.mask
+        and _is_text_profile(args.ground_truth)
+        and _is_text_profile(args.predictions)
+        and _is_text_profile(args.mask)
+        and args.plots_dir is None
+    ):
+        output = _stream_discrete_metrics(
+            ground_truth_filename=args.ground_truth,
+            predictions_filename=args.predictions,
+            mask_filename=args.mask,
+            mask_mode=args.mask_mode,
+            mode=args.mode,
+            noise_threshold=args.noise_threshold,
+            score_scale=args.score_scale,
+            chunk_size=args.chunk_size,
+        )
+        if args.name:
+            output['name'] = args.name
+        print(json.dumps(output, ensure_ascii=False))
+        return
+
+    if streaming_enabled:
+        raise ValueError(
+            'Streaming scorer requires text ground truth, predictions, and mask '
+            'files, and cannot be used with --plots-dir'
+        )
 
     predictions = read_array_from_file(args.predictions, dtype=dtype)
     ground_truth = read_array_from_file(args.ground_truth, dtype=dtype)
