@@ -136,12 +136,20 @@ class SklearnScorer(BinaryScorer):
 
 class SklearnROCAUC(SklearnScorer):
     def score(self, scoring_data: PredictionsGTContainer, **kwargs) -> float:
-        val = float(roc_auc_score(y_true=scoring_data.labels, y_score=scoring_data.scores))
+        val = float(np.clip(
+            roc_auc_score(y_true=scoring_data.labels, y_score=scoring_data.scores),
+            0.0,
+            1.0,
+        ))
         return ScorerResult(value=val)
 
 class SklearnPRAUC(SklearnScorer):
     def score(self, scoring_data: PredictionsGTContainer, **kwargs) -> float:
-        val = float(average_precision_score(y_true=scoring_data.labels, y_score=scoring_data.scores))
+        val = float(np.clip(
+            average_precision_score(y_true=scoring_data.labels, y_score=scoring_data.scores),
+            0.0,
+            1.0,
+        ))
         return ScorerResult(value=val)
 
 @dataclass
@@ -158,7 +166,7 @@ class Pearson(RegressionScorer):
                 return 0
             else:
                 raise Exception("Unknown bug with correlation calculation occured")
-        return float(cor)
+        return float(np.clip(cor, -1.0, 1.0))
 
 @dataclass
 class Spearman(RegressionScorer):
@@ -175,7 +183,7 @@ class Spearman(RegressionScorer):
                 return 0
             else:
                 raise Exception("Unknown bug with correlation calculation occured")
-        return float(cor)
+        return float(np.clip(cor, -1.0, 1.0))
 
 def read_array_from_wig(filename, dtype=float, force_gzip=None):
     wig_ext = None
