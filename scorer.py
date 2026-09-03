@@ -342,8 +342,8 @@ def get_argparser():
     argparser.add_argument('--mask', metavar='FILE',
                            help="Mask file (.txt/.bin, optionally .gz). Positions with value=1 are included in scoring. " +
                            "Must have the same length as input profiles.")
-    argparser.add_argument('--mask-mode', choices=['mask', 'inverse', 'both'], default='mask', metavar='MODE',
-                           help="How to apply mask: 'mask' (use mask=1), 'inverse' (use mask=0), 'both' (compute both separately)")
+    argparser.add_argument('--mask-mode', choices=['mask', 'inverse', 'both', 'all'], default='mask', metavar='MODE',
+                           help="How to apply mask: 'mask' (use mask=1), 'inverse' (use mask=0), 'both' (compute both separately), all (both + without masking)")
     argparser.add_argument('--plots-dir', metavar='DIR',
                            help="Directory for metric plots")
 
@@ -477,7 +477,7 @@ def main():
     noise_threshold = args.noise_threshold  # remove singletons
 
     if mask is not None:
-        if args.mask_mode == 'both':
+        if args.mask_mode == 'all':
             # Compute metrics for mask, inverted_mask, and total
             mask_data = PredictionsGTContainer(
                 scores=predictions[mask],
@@ -498,6 +498,22 @@ def main():
                 "mask": compute_all_metrics(mask_data, scorers, args.plots_dir),
                 "inverted_mask": compute_all_metrics(inverse_data, scorers, args.plots_dir),
                 "total": compute_all_metrics(total_data, scorers, args.plots_dir)
+            }
+        elif args.mask_mode == 'both':
+            # Compute metrics for mask, inverted_mask, and total
+            mask_data = PredictionsGTContainer(
+                scores=predictions[mask],
+                ground_truth=ground_truth[mask],
+                noise_threshold=noise_threshold
+            )
+            inverse_data = PredictionsGTContainer(
+                scores=predictions[~mask],
+                ground_truth=ground_truth[~mask],
+                noise_threshold=noise_threshold
+            )
+            output = {
+                "mask": compute_all_metrics(mask_data, scorers, args.plots_dir),
+                "inverted_mask": compute_all_metrics(inverse_data, scorers, args.plots_dir),
             }
         elif args.mask_mode == 'mask':
             scoring_data = PredictionsGTContainer(
