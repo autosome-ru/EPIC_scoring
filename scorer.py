@@ -157,7 +157,7 @@ class Pearson(RegressionScorer):
                 return 0
             else:
                 raise Exception("Unknown bug with correlation calculation occured")
-        return cor
+        return float(cor)
 
 @dataclass
 class Spearman(RegressionScorer):
@@ -174,7 +174,7 @@ class Spearman(RegressionScorer):
                 return 0
             else:
                 raise Exception("Unknown bug with correlation calculation occured")
-        return cor
+        return float(cor)
 
 def read_array_from_wig(filename, dtype=float, force_gzip=None):
     wig_ext = None
@@ -350,7 +350,7 @@ def get_argparser():
                            help="subset of metrics to calculate (default: %(default)s)")
     argparser.add_argument('--noise-threshold', type=float, default=0.0, metavar='VAL',
                            help='Positions with low scores (0 < score <= threshold) of ground-truth profile are filtered.')
-    argparser.add_argument('--dtype', choices=['int', 'float', 'byte'], default='float', metavar='TYPE',
+    argparser.add_argument('--dtype', choices=['int', 'float', 'float32', 'byte'], default='float', metavar='TYPE',
                            help="Type of score values (default: %(default)s)")
     argparser.add_argument('--name', metavar='STRING',
                            help="Label output score values in the form `{**metrics, name: NAME}`")
@@ -452,6 +452,8 @@ def main():
         dtype = 'B'  # same as np.uint8
     elif args.dtype == 'float': # float64
         dtype = '<f8'
+    elif args.dtype == 'float32':
+        dtype = '<f4'
 
     predictions = read_array_from_file(args.predictions, dtype=dtype)
     ground_truth = read_array_from_file(args.ground_truth, dtype=dtype)
