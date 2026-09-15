@@ -2,6 +2,8 @@
 Scoring for Eukaryotic Promoter and Transcription Initiation Prediction Challenge (EPIC).
 The competition website: https://epic.autosome.org/
 
+Genomes and training data are available on Zenodo: [doi: 10.5281/zenodo.22285753](https://doi.org/10.5281/zenodo.22285753).
+
 ### EPIC scoring scripts
 To compute the performance metrics, we use the Python script `scorer.py` available at GitHub: https://github.com/autosome-ru/EPIC_scoring
 
